@@ -10,9 +10,6 @@ from base_ctrl import BaseController
 # -----------------------------
 # Configuration & Calibration
 # -----------------------------
-# -----------------------------
-# Configuration & Calibration
-# -----------------------------
 FRAME_WIDTH, FRAME_HEIGHT = 580, 440
 BASE_SPEED = 0.12          # Slightly lower base speed helps with sharp turns
 STEER_SENSITIVITY = 0.0025 # INCREASED from 0.0012
@@ -27,7 +24,7 @@ M = cv2.getPerspectiveTransform(SRC_POINTS, DST_POINTS)
 # Tape Fingerprint Parameters
 EXPECTED_LANE_WIDTH = 340 
 TAPE_WIDTH_PIXELS = 14     
-TAPE_MARGIN = 6            
+TAPE_MARGIN = 6
 CONFIDENCE_THRESHOLD = 500 
 SEARCH_MARGIN = 50         
 
@@ -78,7 +75,10 @@ def process_and_drive(frame):
     # 1. Reverting to Canny Edge Detection (as requested)
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    kernel = np.ones((1, 1), np.uint8)
     edges = cv2.Canny(blur, 50, 150)
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+    edges = cv2.morphologyEx(edges, cv2.MORPH_OPEN, kernel)
     warped = cv2.warpPerspective(edges, M, (w, h))
 
     # 2. Histogram with Strict Search Zones
@@ -148,8 +148,17 @@ def video():
     return Response(generate_frames(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
+
+
 # 1. Add a control flag at the top of your script
 is_running = False
+
+
+@app.route("/turn_left")
+def turn_left():
+    # spin left in place
+    base.send_command({"T": 1, "L": -0.1, "R": 0.3})
+    return "Turning left"
 
 @app.route("/start_robot")
 def start_robot():

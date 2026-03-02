@@ -8,35 +8,37 @@ import time
 from base_ctrl import BaseController
 
 # -----------------------------
-# Configuration & Calibration
+# Configuration
 # -----------------------------
 FRAME_WIDTH, FRAME_HEIGHT = 580, 440
+
 BASE_SPEED = 0.12
 STEER_SENSITIVITY = 0.0025
 
-# Perspective Transform
-SRC_POINTS = np.float32([[50, 480], [590, 480], [240, 300], [400, 300]])
-DST_POINTS = np.float32([[150, 480], [490, 480], [150, 0], [490, 0]])
-M = cv2.getPerspectiveTransform(SRC_POINTS, DST_POINTS)
-
-# Tape Fingerprint Parameters
 EXPECTED_LANE_WIDTH = 340
 TAPE_WIDTH_PIXELS = 14
 TAPE_MARGIN = 6
 CONFIDENCE_THRESHOLD = 500
-SEARCH_MARGIN = 50
 
-# PID Variables
-Kp, Ki, Kd = 0.7, 0.0, 0.15
-last_error = 0
-integral = 0
+# Obstacle detection
+OBSTACLE_AREA_THRESH =  1550
+ROI_Y_START = 0.5
+ROI_X_START = 0.35
+ROI_X_END = 0.65
 
 # -----------------------------
-# Hardware Initialization
+# Perspective Transform
+# -----------------------------
+SRC_POINTS = np.float32([[50, 480], [590, 480], [240, 300], [400, 300]])
+DST_POINTS = np.float32([[150, 480], [490, 480], [150, 0], [490, 0]])
+M = cv2.getPerspectiveTransform(SRC_POINTS, DST_POINTS)
+
+# -----------------------------
+# Hardware Init
 # -----------------------------
 def is_raspberry_pi5():
     try:
-        with open('/proc/cpuinfo', 'r') as f:
+        with open("/proc/cpuinfo", "r") as f:
             return "Raspberry Pi 5" in f.read()
     except:
         return False
@@ -44,6 +46,9 @@ def is_raspberry_pi5():
 serial_device = "/dev/ttyAMA0" if is_raspberry_pi5() else "/dev/serial0"
 base = BaseController(serial_device, 115200)
 
+# -----------------------------
+# Camera Init
+# -----------------------------
 picam2 = Picamera2()
 picam2.configure(
     picam2.create_preview_configuration(
@@ -51,11 +56,16 @@ picam2.configure(
     )
 )
 picam2.start()
-
-app = Flask(__name__)
+time.sleep(1)
 
 # -----------------------------
-# Lane Helpers
+# Flask App
+# -----------------------------
+app = Flask(__name__)
+is_running = False
+
+# -----------------------------
+# Helpers
 # -----------------------------
 def find_tape_center(histogram, start_x, end_x):
     best_center = None
@@ -67,18 +77,58 @@ def find_tape_center(histogram, start_x, end_x):
             best_center = x + (TAPE_WIDTH_PIXELS // 2)
     return best_center
 
+def obstacle_in_path(frame):
+    h, w = frame.shape[:2]
+
+    y1 = int(h * ROI_Y_START)
+    x1 = int(w * ROI_X_START)
+    x2 = int(w * ROI_X_END)
+
+    roi = frame[y1:h, x1:x2]
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 50, 150)
+
+    contours, _ = cv2.findContours(
+        edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    for c in contours:
+        if cv2.contourArea(c) > OBSTACLE_AREA_THRESH:
+            return True, (x1, y1, x2, h)
+
+    return False, None
+
 # -----------------------------
 # Core Logic
 # -----------------------------
 def process_and_drive(frame):
-    global last_error, integral
     h, w = frame.shape[:2]
     img_center = w // 2
+
+    obstacle, roi_box = obstacle_in_path(frame)
+
+    if obstacle:
+        base.send_command({"T": 1, "L": 0.0, "R": 0.0})
+
+        viz = frame.copy()
+        x1, y1, x2, y2 = roi_box
+        cv2.rectangle(viz, (x1, y1), (x2, y2), (0, 0, 255), 2)
+        cv2.putText(
+            viz,
+            "OBSTACLE",
+            (x1 + 10, y1 - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 0, 255),
+            2
+        )
+        return viz
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(blur, 50, 150)
-
     warped = cv2.warpPerspective(edges, M, (w, h))
 
     hist = np.sum(warped[int(h * 0.6):, :], axis=0)
@@ -86,35 +136,22 @@ def process_and_drive(frame):
     left_x = find_tape_center(hist, 0, int(w * 0.35))
     right_x = find_tape_center(hist, int(w * 0.65), w - 1)
 
-    l_valid = left_x is not None
-    r_valid = right_x is not None
-
-    if l_valid and r_valid:
-        lane_center = (left_x + right_x) // 2
-        l_col, r_col = (0, 255, 0), (0, 255, 0)
-
-    elif l_valid:
-        lane_center = left_x + (EXPECTED_LANE_WIDTH // 2)
-        right_x = left_x + EXPECTED_LANE_WIDTH
-        l_col, r_col = (0, 255, 255), (0, 0, 150)
-
-    elif r_valid:
-        lane_center = right_x - (EXPECTED_LANE_WIDTH // 2)
-        left_x = right_x - EXPECTED_LANE_WIDTH
-        l_col, r_col = (0, 0, 150), (0, 255, 255)
-
-    else:
+    if left_x is None and right_x is None:
         base.send_command({"T": 1, "L": 0.0, "R": 0.0})
         return cv2.cvtColor(warped, cv2.COLOR_GRAY2BGR)
 
+    if left_x is not None and right_x is not None:
+        lane_center = (left_x + right_x) // 2
+    elif left_x is not None:
+        lane_center = left_x + EXPECTED_LANE_WIDTH // 2
+    else:
+        lane_center = right_x - EXPECTED_LANE_WIDTH // 2
+
     error = lane_center - img_center
-    integral += error
-    derivative = error - last_error
+    steering = error * STEER_SENSITIVITY
 
-    steering_adj = error * STEER_SENSITIVITY
-
-    left_wheel = np.clip(BASE_SPEED + steering_adj, -0.1, 0.5)
-    right_wheel = np.clip(BASE_SPEED - steering_adj, -0.1, 0.5)
+    left_wheel = np.clip(BASE_SPEED + steering, -0.1, 0.5)
+    right_wheel = np.clip(BASE_SPEED - steering, -0.1, 0.5)
 
     base.send_command({
         "T": 1,
@@ -122,41 +159,28 @@ def process_and_drive(frame):
         "R": round(right_wheel, 3)
     })
 
-    last_error = error
-
     viz = cv2.cvtColor(warped, cv2.COLOR_GRAY2BGR)
     cv2.line(viz, (img_center, 0), (img_center, h), (255, 255, 0), 2)
-    cv2.circle(viz, (lane_center, h - 80), 15, (255, 120, 0), -1)
-    cv2.circle(viz, (left_x, h - 40), 20, l_col, -1)
-    cv2.circle(viz, (right_x, h - 40), 20, r_col, -1)
-
-    cv2.putText(
-        viz,
-        f"Error: {error}",
-        (20, 50),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.8,
-        (255, 255, 255),
-        2
-    )
+    cv2.circle(viz, (lane_center, h - 60), 12, (255, 120, 0), -1)
 
     return viz
 
 # -----------------------------
 # Streaming
 # -----------------------------
-is_running = False
-
 def generate_frames():
     while True:
         frame = picam2.capture_array()
+
         if is_running:
-            processed = process_and_drive(frame)
+            output = process_and_drive(frame)
         else:
-            processed = frame
-        ret, jpeg = cv2.imencode(".jpg", processed)
+            output = frame
+
+        ret, jpeg = cv2.imencode(".jpg", output)
         if not ret:
             continue
+
         yield (
             b"--frame\r\n"
             b"Content-Type: image/jpeg\r\n\r\n" +
@@ -178,7 +202,7 @@ def video():
 def start_robot():
     global is_running
     is_running = True
-    return "Robot movement started"
+    return "Robot started"
 
 @app.route("/stop_robot")
 def stop_robot():

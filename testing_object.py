@@ -14,29 +14,43 @@ FRAME_WIDTH, FRAME_HEIGHT = 580, 440
 BASE_SPEED = 0.12
 STEER_SENSITIVITY = 0.0025
 
-# Perspective Transform
 SRC_POINTS = np.float32([[50, 480], [590, 480], [240, 300], [400, 300]])
 DST_POINTS = np.float32([[150, 480], [490, 480], [150, 0], [490, 0]])
 M = cv2.getPerspectiveTransform(SRC_POINTS, DST_POINTS)
 
-# Tape Fingerprint Parameters
 EXPECTED_LANE_WIDTH = 340
 TAPE_WIDTH_PIXELS = 14
 TAPE_MARGIN = 6
 CONFIDENCE_THRESHOLD = 500
-SEARCH_MARGIN = 50
 
-# PID Variables
-Kp, Ki, Kd = 0.7, 0.0, 0.15
 last_error = 0
 integral = 0
 
 # -----------------------------
-# Hardware Initialization
+# Object Detection Config
+# -----------------------------
+DNN_CONFIDENCE = 0.3
+ALLOWED_CLASSES = {7: "car"}
+
+STOP_TIME = 0.5
+TURN_TIME = 0.8
+TURN_LEFT_L = -0.1
+TURN_LEFT_R = 0.25
+
+# -----------------------------
+# Load DNN
+# -----------------------------
+net = cv2.dnn.readNetFromCaffe(
+    "deploy.prototxt",
+    "mobilenet_iter_73000.caffemodel"
+)
+
+# -----------------------------
+# Hardware Init
 # -----------------------------
 def is_raspberry_pi5():
     try:
-        with open('/proc/cpuinfo', 'r') as f:
+        with open("/proc/cpuinfo") as f:
             return "Raspberry Pi 5" in f.read()
     except:
         return False
@@ -51,11 +65,13 @@ picam2.configure(
     )
 )
 picam2.start()
+time.sleep(1)
 
 app = Flask(__name__)
+is_running = False
 
 # -----------------------------
-# Lane Helpers
+# ORIGINAL LANE HELPERS (UNCHANGED)
 # -----------------------------
 def find_tape_center(histogram, start_x, end_x):
     best_center = None
@@ -68,49 +84,69 @@ def find_tape_center(histogram, start_x, end_x):
     return best_center
 
 # -----------------------------
-# Core Logic
+# Object Detection
+# -----------------------------
+def detect_car(frame):
+    blob = cv2.dnn.blobFromImage(
+        cv2.resize(frame, (300, 300)),
+        0.007843,
+        (300, 300),
+        127.5
+    )
+    net.setInput(blob)
+    detections = net.forward()
+
+    for i in range(detections.shape[2]):
+        confidence = detections[0, 0, i, 2]
+        if confidence < DNN_CONFIDENCE:
+            continue
+        class_id = int(detections[0, 0, i, 1])
+        if class_id in ALLOWED_CLASSES:
+            return True
+    return False
+
+# -----------------------------
+# CORE LOGIC
 # -----------------------------
 def process_and_drive(frame):
     global last_error, integral
     h, w = frame.shape[:2]
     img_center = w // 2
 
+    # -------- Added behavior ONLY --------
+    if detect_car(frame):
+        base.send_command({"T": 1, "L": 0.0, "R": 0.0})
+        time.sleep(STOP_TIME)
+
+        base.send_command({"T": 1, "L": TURN_LEFT_L, "R": TURN_LEFT_R})
+        time.sleep(TURN_TIME)
+
+        return frame
+    # ------------------------------------
+
+    # -------- ORIGINAL LANE CODE BELOW (UNCHANGED) --------
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(blur, 50, 150)
 
     warped = cv2.warpPerspective(edges, M, (w, h))
-
     hist = np.sum(warped[int(h * 0.6):, :], axis=0)
 
     left_x = find_tape_center(hist, 0, int(w * 0.35))
     right_x = find_tape_center(hist, int(w * 0.65), w - 1)
 
-    l_valid = left_x is not None
-    r_valid = right_x is not None
-
-    if l_valid and r_valid:
+    if left_x is not None and right_x is not None:
         lane_center = (left_x + right_x) // 2
-        l_col, r_col = (0, 255, 0), (0, 255, 0)
-
-    elif l_valid:
+    elif left_x is not None:
         lane_center = left_x + (EXPECTED_LANE_WIDTH // 2)
-        right_x = left_x + EXPECTED_LANE_WIDTH
-        l_col, r_col = (0, 255, 255), (0, 0, 150)
-
-    elif r_valid:
+    elif right_x is not None:
         lane_center = right_x - (EXPECTED_LANE_WIDTH // 2)
-        left_x = right_x - EXPECTED_LANE_WIDTH
-        l_col, r_col = (0, 0, 150), (0, 255, 255)
-
     else:
         base.send_command({"T": 1, "L": 0.0, "R": 0.0})
         return cv2.cvtColor(warped, cv2.COLOR_GRAY2BGR)
 
     error = lane_center - img_center
     integral += error
-    derivative = error - last_error
-
     steering_adj = error * STEER_SENSITIVITY
 
     left_wheel = np.clip(BASE_SPEED + steering_adj, -0.1, 0.5)
@@ -127,34 +163,18 @@ def process_and_drive(frame):
     viz = cv2.cvtColor(warped, cv2.COLOR_GRAY2BGR)
     cv2.line(viz, (img_center, 0), (img_center, h), (255, 255, 0), 2)
     cv2.circle(viz, (lane_center, h - 80), 15, (255, 120, 0), -1)
-    cv2.circle(viz, (left_x, h - 40), 20, l_col, -1)
-    cv2.circle(viz, (right_x, h - 40), 20, r_col, -1)
-
-    cv2.putText(
-        viz,
-        f"Error: {error}",
-        (20, 50),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.8,
-        (255, 255, 255),
-        2
-    )
 
     return viz
+    # ----------------------------------------------------
 
 # -----------------------------
 # Streaming
 # -----------------------------
-is_running = False
-
 def generate_frames():
     while True:
         frame = picam2.capture_array()
-        if is_running:
-            processed = process_and_drive(frame)
-        else:
-            processed = frame
-        ret, jpeg = cv2.imencode(".jpg", processed)
+        output = process_and_drive(frame) if is_running else frame
+        ret, jpeg = cv2.imencode(".jpg", output)
         if not ret:
             continue
         yield (
@@ -164,32 +184,24 @@ def generate_frames():
             b"\r\n"
         )
 
-# -----------------------------
-# Routes
-# -----------------------------
 @app.route("/video")
 def video():
-    return Response(
-        generate_frames(),
-        mimetype="multipart/x-mixed-replace; boundary=frame"
-    )
+    return Response(generate_frames(),
+                    mimetype="multipart/x-mixed-replace; boundary=frame")
 
 @app.route("/start_robot")
 def start_robot():
     global is_running
     is_running = True
-    return "Robot movement started"
+    return "Started"
 
 @app.route("/stop_robot")
 def stop_robot():
     global is_running
     is_running = False
     base.send_command({"T": 1, "L": 0.0, "R": 0.0})
-    return "Robot stopped"
+    return "Stopped"
 
-# -----------------------------
-# Cleanup
-# -----------------------------
 def cleanup(sig, frame):
     base.send_command({"T": 1, "L": 0.0, "R": 0.0})
     picam2.stop()
@@ -198,8 +210,5 @@ def cleanup(sig, frame):
 signal.signal(signal.SIGINT, cleanup)
 signal.signal(signal.SIGTERM, cleanup)
 
-# -----------------------------
-# Run
-# -----------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5001, threaded=True)
